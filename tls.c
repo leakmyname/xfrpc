@@ -114,17 +114,32 @@ int tls_init(void)
 	SSL_CTX_set_default_verify_paths(g_ssl_ctx);
 	if (conf->tls_trusted_ca_file) {
 		if (SSL_CTX_load_verify_locations(g_ssl_ctx, conf->tls_trusted_ca_file, NULL) != 1) {
-			debug(LOG_ERR, "[TLS] Failed to load CA file: %s", conf->tls_trusted_ca_file);
-			tls_log_errors("SSL_CTX_load_verify_locations");
-			SSL_CTX_free(g_ssl_ctx);
-			g_ssl_ctx = NULL;
-			return -1;
+			if (conf->tls_insecure_skip_verify) {
+				debug(LOG_WARNING, "[TLS] Failed to load CA file %s, continuing because insecureSkipVerify is set",
+				      conf->tls_trusted_ca_file);
+				ERR_clear_error();
+			} else {
+				debug(LOG_ERR, "[TLS] Failed to load CA file: %s", conf->tls_trusted_ca_file);
+				tls_log_errors("SSL_CTX_load_verify_locations");
+				SSL_CTX_free(g_ssl_ctx);
+				g_ssl_ctx = NULL;
+				return -1;
+			}
+		} else {
+			debug(LOG_DEBUG, "[TLS] CA file loaded (combined with system CAs): %s", conf->tls_trusted_ca_file);
 		}
-		SSL_CTX_set_verify(g_ssl_ctx, SSL_VERIFY_PEER, tls_verify_callback);
-		debug(LOG_DEBUG, "[TLS] CA file loaded (combined with system CAs): %s", conf->tls_trusted_ca_file);
+	} else {
+		debug(LOG_DEBUG, "[TLS] Using system default CA store");
+	}
+
+	if (conf->tls_insecure_skip_verify) {
+		/* frp-compatible transport.tls.insecureSkipVerify: do not verify
+		 * the server certificate or hostname.  Useful on OpenWrt images
+		 * that do not ship a complete CA bundle. */
+		SSL_CTX_set_verify(g_ssl_ctx, SSL_VERIFY_NONE, NULL);
+		debug(LOG_WARNING, "[TLS] Certificate verification disabled (insecureSkipVerify)");
 	} else {
 		SSL_CTX_set_verify(g_ssl_ctx, SSL_VERIFY_PEER, tls_verify_callback);
-		debug(LOG_DEBUG, "[TLS] Using system default CA store");
 	}
 
 	/* Load client certificate + key (optional, for mutual TLS) */
@@ -224,18 +239,22 @@ struct bufferevent *tls_wrap_bev(struct event_base *base, struct bufferevent *be
 	}
 
 	/* Set hostname or IP SAN for verification */
-	SSL_set_hostflags(ssl, X509_CHECK_FLAG_NO_PARTIAL_WILDCARDS);
-	if (sni_host) {
-		struct in_addr addr4;
-		struct in6_addr addr6;
-		int is_ip = (inet_pton(AF_INET, sni_host, &addr4) == 1 ||
-					inet_pton(AF_INET6, sni_host, &addr6) == 1);
-		if (!is_ip) {
-			SSL_set1_host(ssl, sni_host);
-		} else {
-			X509_VERIFY_PARAM *param = SSL_get0_param(ssl);
-			if (param)
-				X509_VERIFY_PARAM_set1_ip_asc(param, sni_host);
+	if (conf && conf->tls_insecure_skip_verify) {
+		debug(LOG_DEBUG, "[TLS] Skipping hostname verification (insecureSkipVerify)");
+	} else {
+		SSL_set_hostflags(ssl, X509_CHECK_FLAG_NO_PARTIAL_WILDCARDS);
+		if (sni_host) {
+			struct in_addr addr4;
+			struct in6_addr addr6;
+			int is_ip = (inet_pton(AF_INET, sni_host, &addr4) == 1 ||
+						inet_pton(AF_INET6, sni_host, &addr6) == 1);
+			if (!is_ip) {
+				SSL_set1_host(ssl, sni_host);
+			} else {
+				X509_VERIFY_PARAM *param = SSL_get0_param(ssl);
+				if (param)
+					X509_VERIFY_PARAM_set1_ip_asc(param, sni_host);
+			}
 		}
 	}
 

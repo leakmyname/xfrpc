@@ -1549,6 +1549,9 @@ static int common_handler(void *user, const char *section, const char *name, con
 		SAFE_FREE(config->tls_trusted_ca_file);
 		config->tls_trusted_ca_file = strdup(value);
 	}
+	else if (MATCH("common", "tls_insecure_skip_verify")) {
+		config->tls_insecure_skip_verify = is_true(value);
+	}
 	else if (MATCH("common", "tls_server_name")) {
 		SAFE_FREE(config->tls_server_name);
 		config->tls_server_name = strdup(value);
@@ -1641,6 +1644,7 @@ static void init_common_conf(struct common_conf *config) {
 	config->connect_server_local_ip = NULL;
 	config->proxy_url = NULL;
 	config->tls_disable_custom_first_byte = 1;
+	config->tls_insecure_skip_verify = 0;
 	config->auth_additional_scopes = NULL;
 	config->udp_packet_size = 1500;
 	config->log_to = NULL;
@@ -1928,6 +1932,8 @@ static void load_toml_common(struct toml_doc *doc)
 		SAFE_FREE(c_conf->tls_trusted_ca_file);
 		c_conf->tls_trusted_ca_file = strdup(v);
 	}
+	if ((v = toml_get(root, "transport.tls.insecureSkipVerify")))
+		c_conf->tls_insecure_skip_verify = is_true(v);
 	if ((v = toml_get(root, "transport.tls.serverName"))) {
 		SAFE_FREE(c_conf->tls_server_name);
 		c_conf->tls_server_name = strdup(v);

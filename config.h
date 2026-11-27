@@ -67,6 +67,7 @@ struct common_conf {
 	char    *tls_key_file;        /* client private key file (optional) */
 	char    *tls_trusted_ca_file; /* CA certificate file for verification */
 	char    *tls_server_name;     /* SNI server name (optional) */
+	int     tls_insecure_skip_verify; /* skip certificate verification */
 
 	/* Identity settings */
 	char    *user;                /* client user name (for visitor auth) */
