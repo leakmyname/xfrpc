@@ -1798,8 +1798,14 @@ static void load_toml_common(struct toml_doc *doc)
 		c_conf->server_addr = strdup(v);
 		assert(c_conf->server_addr);
 	}
-	if ((v = toml_get(root, "serverPort")))
-		c_conf->server_port = atoi(v);
+	if ((v = toml_get(root, "serverPort"))) {
+		SAFE_FREE(c_conf->server_port_source);
+		c_conf->server_port_source = strdup(v);
+		assert(c_conf->server_port_source);
+		if (parse_port_text(v, &c_conf->server_port) != 0) {
+			c_conf->server_port = 0;
+		}
+	}
 	if ((v = toml_get(root, "user"))) {
 		SAFE_FREE(c_conf->user);
 		c_conf->user = strdup(v);

@@ -13,6 +13,7 @@
 #include <netinet/in.h>
 #include <netinet/tcp.h>
 #include <arpa/inet.h>
+#include <netdb.h>
 #include <json-c/json.h>
 #include <syslog.h>
 #include <unistd.h>
@@ -633,6 +634,13 @@ struct bufferevent *connect_server(struct event_base *base, const char *name, co
 		bufferevent_set_timeouts(bev, NULL, &tv);
 	}
 
+	/* TLS wrapping needs the socket fd right away, but libevent's
+	 * hostname connect resolves DNS asynchronously and only creates the
+	 * socket inside its callback.  For TLS targets resolve the name first
+	 * and connect by address so bufferevent_getfd() is valid. */
+	int tls_target = tls_is_enabled() && c_conf && c_conf->server_addr &&
+		strcmp(name, c_conf->server_addr) == 0 && port == c_conf->server_port;
+
 	// For IP addresses, connect directly without DNS
 	if (is_valid_ip_address(name)) {
 		struct sockaddr_in sin;
@@ -646,6 +654,38 @@ struct bufferevent *connect_server(struct event_base *base, const char *name, co
 			bufferevent_free(bev);
 			return NULL;
 		}
+	}
+	// TLS to a hostname: resolve synchronously, then connect by address
+	else if (tls_target) {
+		struct addrinfo hints;
+		struct addrinfo *res = NULL;
+		char service[16];
+		int gai_err;
+
+		memset(&hints, 0, sizeof(hints));
+		hints.ai_family = AF_INET;
+		hints.ai_socktype = SOCK_STREAM;
+		snprintf(service, sizeof(service), "%d", port);
+
+		gai_err = getaddrinfo(name, service, &hints, &res);
+		if (gai_err != 0 || !res) {
+			debug(LOG_ERR, "Failed to resolve %s: %s",
+			      name, gai_err ? gai_strerror(gai_err) : "no address");
+			if (res)
+				freeaddrinfo(res);
+			bufferevent_free(bev);
+			return NULL;
+		}
+
+		/* Same as libevent: use the first resolved address only. */
+		if (bufferevent_socket_connect(bev, res->ai_addr, (int)res->ai_addrlen) < 0) {
+			debug(LOG_ERR, "TLS connection to %s:%d failed: %s",
+			      name, port, strerror(errno));
+			freeaddrinfo(res);
+			bufferevent_free(bev);
+			return NULL;
+		}
+		freeaddrinfo(res);
 	}
 	// Otherwise use DNS resolution
 	else if (main_ctl && main_ctl->dnsbase) {
