@@ -38,6 +38,7 @@ struct ws_ctx {
 	int                 is_wss;
 	enum ws_state       state;
 	int                 freed;
+	int                 upgrade_sent;
 };
 
 static void ws_ctx_cleanup(struct ws_ctx *ctx)
@@ -126,6 +127,10 @@ static int ws_send_frame(struct bufferevent *raw_bev, uint8_t opcode,
 
 static void ws_send_upgrade(struct ws_ctx *ctx)
 {
+	if (ctx->upgrade_sent)
+		return;
+	ctx->upgrade_sent = 1;
+
 	uint8_t rnd[16];
 	if (RAND_bytes(rnd, sizeof(rnd)) != 1) {
 		memset(rnd, 0x42, sizeof(rnd));
@@ -198,7 +203,12 @@ static void ws_raw_read_cb(struct bufferevent *bev, void *arg)
 
 	struct evbuffer *in = bufferevent_get_input(bev);
 
-	if (ctx->state == WS_HANDSHAKE) {
+	/* The HTTP response may arrive before libevent delivers the
+	 * BEV_EVENT_CONNECTED event (especially with the TLS filter bev),
+	 * so handle the handshake whenever the connection is not open yet. */
+	if (ctx->state != WS_OPEN) {
+		if (!ctx->upgrade_sent)
+			ws_send_upgrade(ctx);
 		struct evbuffer_ptr eoh = evbuffer_search(in, "\r\n\r\n", 4, NULL);
 		if (eoh.pos < 0) {
 			if (evbuffer_get_length(in) > 16384) {

@@ -26,7 +26,9 @@ debugconf_t debugconf = {
 
 void _debug(const char *filename, int line, int level, const char *format, ...)
 {
-    if (level > debugconf.debuglevel) {
+    /* Warnings and errors are always reported, even when the debug level
+     * is set lower (e.g. "-d 2"), otherwise failures become invisible. */
+    if (level > debugconf.debuglevel && level > LOG_WARNING) {
         return;
     }
 

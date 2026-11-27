@@ -27,11 +27,11 @@ extern debugconf_t debugconf;
  * @param level Debug level
  * @param format... sprintf like format string
  */
-#ifdef XFRPC_DEBUG
+/* Always compile the logging calls in and filter them at runtime by
+ * debugconf.debuglevel.  Compiling them out (the old release behaviour)
+ * hid every LOG_INFO/LOG_DEBUG message, which made connection problems
+ * impossible to diagnose. */
 #define debug(level, format...) _debug(__FILENAME__ , __LINE__, level, format)
-#else
-#define debug(level, format...) do { if (level <= LOG_ERR) _debug(__FILENAME__ , __LINE__, level, format); } while(0)
-#endif
 
 /** @internal */
 void _debug(const char *, int, int, const char *, ...);
