@@ -50,9 +50,12 @@ RUN mkdir -p "${TOOLCHAIN_DIR}" "${SYSROOT}/usr" && \
       [ -n "${url}" ] || continue; \
       echo "Downloading musl cross toolchain from ${url}"; \
       if curl --connect-timeout 20 --retry 3 --retry-delay 5 -fL "${url}" -o /tmp/cross.tgz; then \
-        tar --xz --strip-components=1 -C "${TOOLCHAIN_DIR}" -f /tmp/cross.tgz; \
+        if tar -xz --strip-components=1 -C "${TOOLCHAIN_DIR}" -f /tmp/cross.tgz; then \
+          rm -f /tmp/cross.tgz; \
+          exit 0; \
+        fi; \
+        echo "Failed to extract toolchain from ${url}, trying next mirror" >&2; \
         rm -f /tmp/cross.tgz; \
-        exit 0; \
       fi; \
     done; \
     echo "Failed to download musl cross toolchain" >&2; \
