@@ -51,6 +51,13 @@
 #include "telnetd.h"
 #include "../debug.h"
 
+#if defined(XTABS)
+#define TELNETD_TABDLY XTABS
+#elif defined(OXTABS)
+#define TELNETD_TABDLY OXTABS
+#else
+#define TELNETD_TABDLY 0
+#endif
 
 typedef struct sockaddr_in sockaddr_type;
 static const char *loginpath = "/bin/login";
@@ -246,7 +253,7 @@ static void
 send_iac(struct tsession *ts, unsigned char command, int option)
 {
 	/* We rely on that there is space in the buffer for now.  */
-	char *b = ts->buf2 + ts->rdidx2;
+	unsigned char *b = (unsigned char *)(ts->buf2 + ts->rdidx2);
 	*b++ = IAC;
 	*b++ = command;
 	*b++ = option;
@@ -335,7 +342,7 @@ make_new_session(int sockfd)
 
 		tcgetattr(0, &termbuf);
 		termbuf.c_lflag |= ECHO; /* if we use readline we dont want this */
-		termbuf.c_oflag |= ONLCR | XTABS;
+		termbuf.c_oflag |= ONLCR | TELNETD_TABDLY;
 		termbuf.c_iflag |= ICRNL;
 		termbuf.c_iflag &= ~IXOFF;
 		/*termbuf.c_lflag &= ~ICANON;*/

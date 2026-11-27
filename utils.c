@@ -21,7 +21,11 @@
 #include <sys/socket.h>
 #include <netdb.h>
 #include <ifaddrs.h>
+#ifdef __linux__
 #include <linux/if_link.h>
+#elif defined(__APPLE__)
+#include <net/if_dl.h>
+#endif
 #include <stdbool.h>
 
 #include "utils.h"
@@ -75,11 +79,12 @@ int is_valid_ip_address(const char *ip_address)
  */
 int get_net_mac(const char *net_if_name, char *mac, int mac_len) 
 {
+#ifdef __linux__
 	struct ifreq ifreq;
 	int sock;
 
-	// Validate input parameters: 12 hex chars + 1 null terminator = 13 bytes minimum
-	if (!net_if_name || !mac || mac_len < 13) {
+	// Validate input parameters
+	if (!net_if_name || !mac || mac_len < 12) {
 		return 1;
 	}
 
@@ -109,6 +114,48 @@ int get_net_mac(const char *net_if_name, char *mac, int mac_len)
 
 	close(sock);
 	return 0;
+#elif defined(__APPLE__)
+	struct ifaddrs *ifaddr = NULL, *ifa = NULL;
+	int ret = 1;
+
+	if (!net_if_name || !mac || mac_len < 13) {
+		return 1;
+	}
+
+	if (getifaddrs(&ifaddr) == -1) {
+		perror("getifaddrs");
+		return 1;
+	}
+
+	for (ifa = ifaddr; ifa != NULL; ifa = ifa->ifa_next) {
+		if (ifa->ifa_addr == NULL || ifa->ifa_addr->sa_family != AF_LINK) {
+			continue;
+		}
+		if (strcmp(ifa->ifa_name, net_if_name) != 0) {
+			continue;
+		}
+
+		const struct sockaddr_dl *sdl = (const struct sockaddr_dl *)ifa->ifa_addr;
+		const unsigned char *addr = (const unsigned char *)LLADDR(sdl);
+		if (sdl->sdl_alen < 6) {
+			continue;
+		}
+
+		for (int i = 0; i < 6; i++) {
+			snprintf(mac + (i * 2), mac_len - (i * 2), "%02X", addr[i]);
+		}
+		ret = 0;
+		break;
+	}
+
+	freeifaddrs(ifaddr);
+	return ret;
+#else
+	(void)net_if_name;
+	(void)mac;
+	(void)mac_len;
+	return 1;
+#endif
 }
 
 /**
@@ -138,13 +185,17 @@ int show_net_ifname()
 			continue;
 
 		family = ifa->ifa_addr->sa_family;
+		const char *family_name =
+#ifdef __linux__
+			   (family == AF_PACKET) ? "AF_PACKET" :
+#endif
+			   (family == AF_INET) ? "AF_INET" :
+			   (family == AF_INET6) ? "AF_INET6" : "???";
 
 		// Display interface name and address family
 		printf("%-8s %s (%d)\n",
 			   ifa->ifa_name,
-			   (family == AF_PACKET) ? "AF_PACKET" :
-			   (family == AF_INET) ? "AF_INET" :
-			   (family == AF_INET6) ? "AF_INET6" : "???",
+			   family_name,
 			   family);
 
 		// Handle IP addresses
@@ -162,6 +213,7 @@ int show_net_ifname()
 			printf("\t\taddress: <%s>\n", host);
 		}
 		// Handle packet statistics
+		#ifdef __linux__
 		else if (family == AF_PACKET && ifa->ifa_data != NULL) {
 			struct rtnl_link_stats *stats = (struct rtnl_link_stats *)ifa->ifa_data;
 			printf("\t\ttx_packets = %10u; rx_packets = %10u\n"
@@ -169,6 +221,7 @@ int show_net_ifname()
 				   stats->tx_packets, stats->rx_packets,
 				   stats->tx_bytes, stats->rx_bytes);
 		}
+		#endif
 	}
 
 	freeifaddrs(ifaddr);
@@ -214,21 +267,28 @@ int get_net_ifname(char *if_buf, int blen)
 			// Check for router specific interfaces
 			if (strcmp(ifa->ifa_name, "br-lan") == 0 || 
 				strcmp(ifa->ifa_name, "br0") == 0) {
-				snprintf(if_buf, (size_t)blen, "%s", ifa->ifa_name);
+				strncpy(if_buf, ifa->ifa_name, blen);
 				freeifaddrs(ifaddr);
 				return 0;
 			}
-		} else if (family == AF_PACKET && 
-				  ifa->ifa_data != NULL && 
-				  strcmp(ifa->ifa_name, "lo") != 0) {
-			// Store first non-loopback interface as backup
-			snprintf(backup_ifname, sizeof(backup_ifname), "%s", ifa->ifa_name);
+#ifdef __linux__
+		} else if (family == AF_PACKET &&
+				   ifa->ifa_data != NULL &&
+				   strcmp(ifa->ifa_name, "lo") != 0) {
+			strncpy(backup_ifname, ifa->ifa_name, IFNAMSIZ - 1);
+#else
+			if (backup_ifname[0] == '\0' &&
+				strcmp(ifa->ifa_name, "lo0") != 0 &&
+				strcmp(ifa->ifa_name, "lo") != 0) {
+				strncpy(backup_ifname, ifa->ifa_name, IFNAMSIZ - 1);
+			}
+#endif
 		}
 	}
 
 	// Use backup interface if router interfaces not found
 	if (backup_ifname[0] != '\0') {
-		snprintf(if_buf, (size_t)blen, "%s", backup_ifname);
+		strncpy(if_buf, backup_ifname, blen);
 		freeifaddrs(ifaddr);
 		return 0;
 	}
@@ -255,8 +315,7 @@ int get_net_ifname(char *if_buf, int blen)
 int dns_unified(const char *dname, char *udname_buf, int udname_buf_len)
 {
 	// Validate input parameters
-	if (!dname || !udname_buf || udname_buf_len <= 0 ||
-	    (size_t)udname_buf_len < strlen(dname) + 1) {
+	if (!dname || !udname_buf || udname_buf_len < strlen(dname) + 1) {
 		return 1;
 	}
 

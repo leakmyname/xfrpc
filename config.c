@@ -10,10 +10,18 @@
 #include <time.h>
 #include <unistd.h>
 #include <ctype.h>
+#include <errno.h>
 #include <sys/types.h>
+#include <sys/socket.h>
+#include <sys/time.h>
+#include <netdb.h>
+#include <arpa/inet.h>
 #include <pwd.h>
 #include <glob.h>
 #include <libgen.h>
+
+#include <openssl/ssl.h>
+#include <openssl/err.h>
 
 #include "ini.h"
 #include "toml_parser.h"
@@ -49,6 +57,611 @@ static const char *valid_types[] = {
 static struct common_conf    *c_conf;    /* Common configuration settings */
 static struct proxy_service *all_ps;     /* Hash table of all proxy services */
 
+#define SERVER_PORT_TEXT_MAX      128
+#define SERVER_PORT_URL_MAX       512
+#define SERVER_PORT_HOST_MAX      256
+#define SERVER_PORT_DNS_PACKET    512
+#define SERVER_PORT_NET_TIMEOUT   3
+
+struct server_port_url {
+	int https;
+	char host[SERVER_PORT_HOST_MAX];
+	int port;
+	char path[SERVER_PORT_URL_MAX];
+};
+
+static int parse_port_text(const char *text, int *port_out)
+{
+	const char *start;
+	char *end;
+	long port;
+	char quote = '\0';
+
+	if (!text || !port_out) {
+		return -1;
+	}
+
+	start = text;
+	while (isspace((unsigned char)*start)) {
+		start++;
+	}
+
+	if (*start == '"' || *start == '\'') {
+		quote = *start;
+		start++;
+	}
+
+	errno = 0;
+	port = strtol(start, &end, 10);
+	if (start == end || errno != 0 || port <= 0 || port > 65535) {
+		return -1;
+	}
+
+	while (isspace((unsigned char)*end)) {
+		end++;
+	}
+
+	if (quote) {
+		if (*end != quote) {
+			return -1;
+		}
+		end++;
+		while (isspace((unsigned char)*end)) {
+			end++;
+		}
+	}
+
+	if (*end != '\0') {
+		return -1;
+	}
+
+	*port_out = (int)port;
+	return 0;
+}
+
+static int parse_port_url(const char *url, struct server_port_url *out)
+{
+	const char *scheme;
+	const char *host_start;
+	const char *path_start;
+	const char *host_end;
+	const char *colon;
+	size_t host_len;
+	size_t path_len;
+	int default_port;
+	int port;
+
+	if (!url || !out) {
+		return -1;
+	}
+
+	memset(out, 0, sizeof(*out));
+	if (strncmp(url, "https://", 8) == 0) {
+		scheme = url + 8;
+		out->https = 1;
+		default_port = 443;
+	} else if (strncmp(url, "http://", 7) == 0) {
+		scheme = url + 7;
+		out->https = 0;
+		default_port = 80;
+	} else {
+		return -1;
+	}
+
+	host_start = scheme;
+	path_start = strchr(host_start, '/');
+	host_end = path_start ? path_start : url + strlen(url);
+	if (host_end == host_start) {
+		return -1;
+	}
+
+	colon = memchr(host_start, ':', (size_t)(host_end - host_start));
+	if (colon) {
+		char port_buf[16];
+		size_t port_len = (size_t)(host_end - colon - 1);
+
+		if (port_len == 0 || port_len >= sizeof(port_buf)) {
+			return -1;
+		}
+		memcpy(port_buf, colon + 1, port_len);
+		port_buf[port_len] = '\0';
+		if (parse_port_text(port_buf, &port) != 0) {
+			return -1;
+		}
+		host_end = colon;
+	} else {
+		port = default_port;
+	}
+
+	host_len = (size_t)(host_end - host_start);
+	if (host_len == 0 || host_len >= sizeof(out->host)) {
+		return -1;
+	}
+	memcpy(out->host, host_start, host_len);
+	out->host[host_len] = '\0';
+
+	if (path_start) {
+		path_len = strlen(path_start);
+		if (path_len >= sizeof(out->path)) {
+			return -1;
+		}
+		memcpy(out->path, path_start, path_len + 1);
+	} else {
+		strcpy(out->path, "/");
+	}
+
+	out->port = port;
+	return 0;
+}
+
+static int set_socket_timeout(int fd)
+{
+	struct timeval tv;
+
+	tv.tv_sec = SERVER_PORT_NET_TIMEOUT;
+	tv.tv_usec = 0;
+	if (setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv)) < 0) {
+		return -1;
+	}
+	if (setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv)) < 0) {
+		return -1;
+	}
+	return 0;
+}
+
+static int connect_tcp_host(const char *host, int port)
+{
+	struct addrinfo hints;
+	struct addrinfo *res = NULL;
+	struct addrinfo *rp;
+	char service[16];
+	int fd = -1;
+	int ret;
+
+	memset(&hints, 0, sizeof(hints));
+	hints.ai_family = AF_UNSPEC;
+	hints.ai_socktype = SOCK_STREAM;
+	snprintf(service, sizeof(service), "%d", port);
+
+	ret = getaddrinfo(host, service, &hints, &res);
+	if (ret != 0) {
+		debug(LOG_ERR, "Failed to resolve host %s: %s", host, gai_strerror(ret));
+		return -1;
+	}
+
+	for (rp = res; rp; rp = rp->ai_next) {
+		fd = socket(rp->ai_family, rp->ai_socktype, rp->ai_protocol);
+		if (fd < 0) {
+			continue;
+		}
+		set_socket_timeout(fd);
+		if (connect(fd, rp->ai_addr, rp->ai_addrlen) == 0) {
+			break;
+		}
+		close(fd);
+		fd = -1;
+	}
+
+	freeaddrinfo(res);
+	return fd;
+}
+
+static int socket_write_all(int fd, const char *buf, size_t len)
+{
+	size_t sent = 0;
+
+	while (sent < len) {
+		ssize_t n = send(fd, buf + sent, len - sent, 0);
+		if (n <= 0) {
+			return -1;
+		}
+		sent += (size_t)n;
+	}
+	return 0;
+}
+
+static int ssl_write_all(SSL *ssl, const char *buf, size_t len)
+{
+	size_t sent = 0;
+
+	while (sent < len) {
+		int n = SSL_write(ssl, buf + sent, (int)(len - sent));
+		if (n <= 0) {
+			return -1;
+		}
+		sent += (size_t)n;
+	}
+	return 0;
+}
+
+static const char *http_body_start(char *response)
+{
+	char *body = strstr(response, "\r\n\r\n");
+
+	if (body) {
+		return body + 4;
+	}
+
+	body = strstr(response, "\n\n");
+	if (body) {
+		return body + 2;
+	}
+
+	return response;
+}
+
+static int http_response_ok(const char *response)
+{
+	int status = 0;
+
+	if (strncmp(response, "HTTP/", 5) != 0) {
+		return 1;
+	}
+
+	if (sscanf(response, "HTTP/%*s %d", &status) != 1) {
+		return 0;
+	}
+
+	return status >= 200 && status < 300;
+}
+
+static int resolve_port_from_url(const char *url, int *port_out)
+{
+	struct server_port_url parsed;
+	char request[SERVER_PORT_URL_MAX + SERVER_PORT_HOST_MAX + 128];
+	char response[4096];
+	size_t total = 0;
+	int fd;
+	int ret = -1;
+	SSL_CTX *ctx = NULL;
+	SSL *ssl = NULL;
+
+	if (parse_port_url(url, &parsed) != 0) {
+		debug(LOG_ERR, "Invalid server_port URL: %s", url);
+		return -1;
+	}
+
+	fd = connect_tcp_host(parsed.host, parsed.port);
+	if (fd < 0) {
+		debug(LOG_ERR, "Failed to connect dynamic port URL host %s:%d",
+			  parsed.host, parsed.port);
+		return -1;
+	}
+
+	snprintf(request, sizeof(request),
+			 "GET %s HTTP/1.0\r\n"
+			 "Host: %s\r\n"
+			 "User-Agent: xfrpc\r\n"
+			 "Connection: close\r\n\r\n",
+			 parsed.path, parsed.host);
+
+	if (parsed.https) {
+		ctx = SSL_CTX_new(TLS_client_method());
+		if (!ctx) {
+			goto done;
+		}
+		SSL_CTX_set_verify(ctx, SSL_VERIFY_NONE, NULL);
+		ssl = SSL_new(ctx);
+		if (!ssl) {
+			goto done;
+		}
+		SSL_set_fd(ssl, fd);
+		SSL_set_tlsext_host_name(ssl, parsed.host);
+		if (SSL_connect(ssl) <= 0) {
+			goto done;
+		}
+		if (ssl_write_all(ssl, request, strlen(request)) != 0) {
+			goto done;
+		}
+		while (total < sizeof(response) - 1) {
+			int n = SSL_read(ssl, response + total,
+							 (int)(sizeof(response) - 1 - total));
+			if (n <= 0) {
+				break;
+			}
+			total += (size_t)n;
+		}
+	} else {
+		if (socket_write_all(fd, request, strlen(request)) != 0) {
+			goto done;
+		}
+		while (total < sizeof(response) - 1) {
+			ssize_t n = recv(fd, response + total,
+							 sizeof(response) - 1 - total, 0);
+			if (n <= 0) {
+				break;
+			}
+			total += (size_t)n;
+		}
+	}
+
+	if (total == 0) {
+		goto done;
+	}
+
+	response[total] = '\0';
+	if (!http_response_ok(response)) {
+		debug(LOG_ERR, "Dynamic port URL returned non-2xx response: %s", url);
+		goto done;
+	}
+
+	ret = parse_port_text(http_body_start(response), port_out);
+
+done:
+	if (ssl) {
+		SSL_shutdown(ssl);
+		SSL_free(ssl);
+	}
+	if (ctx) {
+		SSL_CTX_free(ctx);
+	}
+	close(fd);
+	return ret;
+}
+
+static int read_dns_server(char *server, size_t server_len)
+{
+	FILE *fp;
+	char line[256];
+
+	if (!server || server_len == 0) {
+		return -1;
+	}
+
+	fp = fopen("/etc/resolv.conf", "r");
+	if (!fp) {
+		strncpy(server, "8.8.8.8", server_len);
+		server[server_len - 1] = '\0';
+		return 0;
+	}
+
+	while (fgets(line, sizeof(line), fp)) {
+		char ns[64];
+
+		if (sscanf(line, "nameserver %63s", ns) == 1 &&
+			is_valid_ip_address(ns)) {
+			snprintf(server, server_len, "%s", ns);
+			fclose(fp);
+			return 0;
+		}
+	}
+
+	fclose(fp);
+	strncpy(server, "8.8.8.8", server_len);
+	server[server_len - 1] = '\0';
+	return 0;
+}
+
+static int encode_dns_name(const char *name, uint8_t *buf, size_t buflen,
+						   size_t *offset)
+{
+	const char *pos = name;
+
+	while (*pos) {
+		const char *dot = strchr(pos, '.');
+		size_t label_len = dot ? (size_t)(dot - pos) : strlen(pos);
+
+		if (label_len == 0) {
+			break;
+		}
+		if (label_len > 63 || *offset + label_len + 1 >= buflen) {
+			return -1;
+		}
+		buf[(*offset)++] = (uint8_t)label_len;
+		memcpy(buf + *offset, pos, label_len);
+		*offset += label_len;
+		if (!dot) {
+			break;
+		}
+		pos = dot + 1;
+	}
+
+	if (*offset >= buflen) {
+		return -1;
+	}
+	buf[(*offset)++] = 0;
+	return 0;
+}
+
+static int dns_skip_name(const uint8_t *buf, size_t len, size_t *offset)
+{
+	while (*offset < len) {
+		uint8_t c = buf[*offset];
+
+		if ((c & 0xC0) == 0xC0) {
+			if (*offset + 1 >= len) {
+				return -1;
+			}
+			*offset += 2;
+			return 0;
+		}
+		if ((c & 0xC0) != 0) {
+			return -1;
+		}
+		(*offset)++;
+		if (c == 0) {
+			return 0;
+		}
+		if (*offset + c > len) {
+			return -1;
+		}
+		*offset += c;
+	}
+
+	return -1;
+}
+
+static uint16_t dns_u16(const uint8_t *buf)
+{
+	return (uint16_t)((buf[0] << 8) | buf[1]);
+}
+
+static int parse_txt_port_response(const uint8_t *buf, size_t len, int *port_out)
+{
+	uint16_t qdcount;
+	uint16_t ancount;
+	size_t offset = 12;
+	uint16_t i;
+
+	if (len < 12 || !port_out) {
+		return -1;
+	}
+	if ((buf[3] & 0x0F) != 0) {
+		return -1;
+	}
+
+	qdcount = dns_u16(buf + 4);
+	ancount = dns_u16(buf + 6);
+
+	for (i = 0; i < qdcount; i++) {
+		if (dns_skip_name(buf, len, &offset) != 0 || offset + 4 > len) {
+			return -1;
+		}
+		offset += 4;
+	}
+
+	for (i = 0; i < ancount; i++) {
+		uint16_t type;
+		uint16_t class_id;
+		uint16_t rdlen;
+
+		if (dns_skip_name(buf, len, &offset) != 0 || offset + 10 > len) {
+			return -1;
+		}
+
+		type = dns_u16(buf + offset);
+		class_id = dns_u16(buf + offset + 2);
+		rdlen = dns_u16(buf + offset + 8);
+		offset += 10;
+		if (offset + rdlen > len) {
+			return -1;
+		}
+
+		if (type == 16 && class_id == 1) {
+			char text[SERVER_PORT_TEXT_MAX];
+			size_t text_len = 0;
+			size_t end = offset + rdlen;
+			size_t pos = offset;
+
+			while (pos < end) {
+				uint8_t part_len = buf[pos++];
+
+				if (pos + part_len > end) {
+					return -1;
+				}
+				if (text_len + part_len >= sizeof(text)) {
+					return -1;
+				}
+				memcpy(text + text_len, buf + pos, part_len);
+				text_len += part_len;
+				pos += part_len;
+			}
+			text[text_len] = '\0';
+			return parse_port_text(text, port_out);
+		}
+
+		offset += rdlen;
+	}
+
+	return -1;
+}
+
+static int resolve_port_from_txt(const char *domain, int *port_out)
+{
+	uint8_t query[SERVER_PORT_DNS_PACKET];
+	uint8_t response[SERVER_PORT_DNS_PACKET];
+	char dns_server[64];
+	struct sockaddr_in addr;
+	size_t offset = 12;
+	uint16_t id;
+	int fd;
+	ssize_t n;
+
+	if (!domain || !port_out || read_dns_server(dns_server, sizeof(dns_server)) != 0) {
+		return -1;
+	}
+
+	memset(query, 0, sizeof(query));
+	id = (uint16_t)(time(NULL) ^ getpid());
+	query[0] = (uint8_t)(id >> 8);
+	query[1] = (uint8_t)(id & 0xff);
+	query[2] = 0x01;
+	query[5] = 0x01;
+
+	if (encode_dns_name(domain, query, sizeof(query), &offset) != 0 ||
+		offset + 4 > sizeof(query)) {
+		return -1;
+	}
+	query[offset++] = 0x00;
+	query[offset++] = 0x10;
+	query[offset++] = 0x00;
+	query[offset++] = 0x01;
+
+	fd = socket(AF_INET, SOCK_DGRAM, 0);
+	if (fd < 0) {
+		return -1;
+	}
+	set_socket_timeout(fd);
+
+	memset(&addr, 0, sizeof(addr));
+	addr.sin_family = AF_INET;
+	addr.sin_port = htons(53);
+	addr.sin_addr.s_addr = inet_addr(dns_server);
+
+	if (sendto(fd, query, offset, 0, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
+		close(fd);
+		return -1;
+	}
+
+	n = recvfrom(fd, response, sizeof(response), 0, NULL, NULL);
+	close(fd);
+	if (n <= 0) {
+		return -1;
+	}
+	if (n < 2 || response[0] != query[0] || response[1] != query[1]) {
+		return -1;
+	}
+
+	return parse_txt_port_response(response, (size_t)n, port_out);
+}
+
+int resolve_common_server_port(struct common_conf *config)
+{
+	const char *source;
+	int port;
+
+	if (!config) {
+		return -1;
+	}
+
+	source = config->server_port_source;
+	if (!source || source[0] == '\0') {
+		config->server_port = config->server_port > 0 ? config->server_port : 7000;
+		return 0;
+	}
+
+	if (parse_port_text(source, &port) == 0) {
+		config->server_port = port;
+		return 0;
+	}
+
+	if (strncmp(source, "http://", 7) == 0 || strncmp(source, "https://", 8) == 0) {
+		if (resolve_port_from_url(source, &port) != 0) {
+			debug(LOG_ERR, "Failed to resolve server_port from URL: %s", source);
+			return -1;
+		}
+	} else {
+		if (resolve_port_from_txt(source, &port) != 0) {
+			debug(LOG_ERR, "Failed to resolve server_port from TXT record: %s", source);
+			return -1;
+		}
+	}
+
+	config->server_port = port;
+	debug(LOG_INFO, "Resolved dynamic server_port [%s] -> %d", source, port);
+	return 0;
+}
+
 /**
  * @brief Gets the common configuration settings
  * @return struct common_conf* Pointer to common configuration structure
@@ -70,6 +683,7 @@ void free_common_config(void)
 	if (!c_conf)
 		return;
 	SAFE_FREE(c_conf->server_addr);
+	SAFE_FREE(c_conf->server_port_source);
 	SAFE_FREE(c_conf->auth_token);
 	SAFE_FREE(c_conf->auth_method);
 	SAFE_FREE(c_conf->oidc_client_id);
@@ -149,8 +763,9 @@ static void dump_common_conf(void)
 		return;
 	}
 
-	debug(LOG_DEBUG, "Section[common]: {server_addr:%s, server_port:%d, auth_token:%s, interval:%d, timeout:%d, tls:%d}",
+	debug(LOG_DEBUG, "Section[common]: {server_addr:%s, server_port:%s, resolved_server_port:%d, auth_token:%s, interval:%d, timeout:%d}",
 		c_conf->server_addr, 
+		c_conf->server_port_source ? c_conf->server_port_source : "",
 		c_conf->server_port, 
 		c_conf->auth_token, 
 		c_conf->heartbeat_interval, 
@@ -882,7 +1497,12 @@ static int common_handler(void *user, const char *section, const char *name, con
 		assert(config->server_addr);
 	} 
 	else if (MATCH("common", "server_port")) {
-		config->server_port = atoi(value);
+		SAFE_FREE(config->server_port_source);
+		config->server_port_source = strdup(value);
+		assert(config->server_port_source);
+		if (parse_port_text(value, &config->server_port) != 0) {
+			config->server_port = 0;
+		}
 	}
 	else if (MATCH("common", "heartbeat_interval")) {
 		config->heartbeat_interval = atoi(value);
@@ -999,6 +1619,8 @@ static void init_common_conf(struct common_conf *config) {
 	assert(config->server_addr);
 	
 	config->server_port = 7000;
+	config->server_port_source = strdup("7000");
+	assert(config->server_port_source);
 	config->heartbeat_interval = 30;
 	config->heartbeat_timeout = 90;
 	config->tcp_mux = 1;

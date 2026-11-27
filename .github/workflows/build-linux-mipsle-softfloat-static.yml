@@ -1,0 +1,39 @@
+name: build linux mipsle softfloat static
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+
+    env:
+      TARGET_TRIPLE: mipsel-linux-muslsf
+      MUSL_CROSS_URLS: https://vpn.uestc.eu.cc/proxy/https://musl.cc/mipsel-linux-muslsf-cross.tgz https://more.musl.cc/x86_64-linux-musl/mipsel-linux-muslsf-cross.tgz https://musl.cc/mipsel-linux-muslsf-cross.tgz
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Build xfrpc for linux mipsle softfloat static
+        run: |
+          set -eux
+          rm -rf dist
+          docker build \
+            --progress=plain \
+            -f docker/Dockerfile.cross \
+            --build-arg TARGET_TRIPLE="${TARGET_TRIPLE}" \
+            --build-arg MUSL_CROSS_URLS="${MUSL_CROSS_URLS}" \
+            --build-arg EXTRA_C_FLAGS="-msoft-float" \
+            --target export-stage \
+            --output type=local,dest=dist \
+            .
+          mv dist/xfrpc dist/xfrpc-linux-mipsle-softfloat-static
+          file dist/xfrpc-linux-mipsle-softfloat-static
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: xfrpc-linux-mipsle-softfloat-static
+          path: dist/xfrpc-linux-mipsle-softfloat-static
+          if-no-files-found: error

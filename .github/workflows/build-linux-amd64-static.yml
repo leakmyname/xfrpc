@@ -1,0 +1,45 @@
+name: build linux amd64 and arm64 static
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: amd64
+            target_triple: x86_64-linux-musl
+          - arch: arm64
+            target_triple: aarch64-linux-musl
+
+    env:
+      TARGET_TRIPLE: ${{ matrix.target_triple }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Build xfrpc for linux ${{ matrix.arch }} static
+        run: |
+          set -eux
+          rm -rf dist
+          docker build \
+            --progress=plain \
+            -f docker/Dockerfile.cross \
+            --build-arg TARGET_TRIPLE="${TARGET_TRIPLE}" \
+            --target export-stage \
+            --output type=local,dest=dist \
+            .
+          mv dist/xfrpc "dist/xfrpc-linux-${{ matrix.arch }}-static"
+          file "dist/xfrpc-linux-${{ matrix.arch }}-static"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: xfrpc-linux-${{ matrix.arch }}-static
+          path: dist/xfrpc-linux-${{ matrix.arch }}-static
+          if-no-files-found: error

@@ -33,6 +33,7 @@ struct common_conf {
 	/* Server settings */
 	char    *server_addr;          /* default 127.0.0.1 */
 	int     server_port;           /* default 7000 */
+	char    *server_port_source;    /* numeric port, TXT domain, or HTTP(S) URL */
 	char    *auth_token;
 
 	/* OIDC settings */
@@ -104,6 +105,7 @@ struct common_conf {
 struct common_conf *get_common_config(void);
 void free_common_config(void);
 void load_config(const char *confile);
+int resolve_common_server_port(struct common_conf *config);
 
 /* Proxy service management functions */
 struct proxy_service *get_proxy_service(const char *proxy_name);

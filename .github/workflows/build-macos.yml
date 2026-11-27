@@ -1,0 +1,61 @@
+name: build macos x86 and arm64
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: x86_64
+            runner: macos-15-intel
+          - arch: arm64
+            runner: macos-15
+
+    runs-on: ${{ matrix.runner }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install build dependencies
+        run: |
+          set -eux
+          brew install cmake pkg-config json-c libevent openssl@3 zlib
+
+      - name: Build xfrpc for macos ${{ matrix.arch }}
+        shell: bash
+        run: |
+          set -eux
+          OPENSSL_PREFIX="$(brew --prefix openssl@3)"
+          JSON_C_PREFIX="$(brew --prefix json-c)"
+          LIBEVENT_PREFIX="$(brew --prefix libevent)"
+          ZLIB_PREFIX="$(brew --prefix zlib)"
+
+          cmake -S . -B "build-${{ matrix.arch }}" \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DDEBUG=OFF \
+            -DENABLE_SANITIZER=OFF \
+            -DCMAKE_PREFIX_PATH="${OPENSSL_PREFIX};${JSON_C_PREFIX};${LIBEVENT_PREFIX};${ZLIB_PREFIX}" \
+            -DOPENSSL_ROOT_DIR="${OPENSSL_PREFIX}" \
+            -DJSON-C_INCLUDE_DIR="${JSON_C_PREFIX}/include" \
+            -DJSON-C_LIBRARY="${JSON_C_PREFIX}/lib/libjson-c.dylib" \
+            -DLIBEVENT_INCLUDE_DIR="${LIBEVENT_PREFIX}/include" \
+            -DLIBEVENT_LIB="${LIBEVENT_PREFIX}/lib/libevent.dylib" \
+            -DZLIB_INCLUDE_DIR="${ZLIB_PREFIX}/include" \
+            -DZLIB_LIBRARY="${ZLIB_PREFIX}/lib/libz.dylib"
+          cmake --build "build-${{ matrix.arch }}" --parallel "$(sysctl -n hw.ncpu)"
+
+          mkdir -p dist
+          cp "build-${{ matrix.arch }}/xfrpc" "dist/xfrpc-macos-${{ matrix.arch }}"
+          strip "dist/xfrpc-macos-${{ matrix.arch }}" || true
+          file "dist/xfrpc-macos-${{ matrix.arch }}"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: xfrpc-macos-${{ matrix.arch }}
+          path: dist/xfrpc-macos-${{ matrix.arch }}
+          if-no-files-found: error

@@ -271,6 +271,18 @@ static int init_tcp_mux_client(struct proxy_client *client) {
 static int init_direct_client(struct proxy_client *client, 
 							const char *server_addr, 
 							int server_port) {
+	struct common_conf *port_conf = get_common_config();
+
+	/* The server port may be provided by a domain (TXT record) or an URL.
+	 * Re-resolve it for every work connection so a changed port is picked up. */
+	if (port_conf) {
+		if (resolve_common_server_port(port_conf) != 0) {
+			debug(LOG_ERR, "Failed to resolve server port for work connection");
+			return -1;
+		}
+		server_port = port_conf->server_port;
+	}
+
 	struct bufferevent *bev = connect_server(client->base, server_addr, server_port);
 	if (!bev) {
 		debug(LOG_ERR, "Failed to connect to server [%s:%d]", 
@@ -2244,9 +2256,23 @@ static int init_server_connection(struct bufferevent **bev_out,
 								const char *server_addr, 
 								int server_port) 
 {
+	struct common_conf *port_conf = get_common_config();
+
 	if (!bev_out || !base || !server_addr) {
 		debug(LOG_ERR, "Invalid parameters for server connection");
 		return -1;
+	}
+
+	/* Re-resolve a dynamic server_port before every control connection so
+	 * that a changed TXT record or URL body is picked up on reconnect. */
+	if (port_conf && port_conf->server_port_source &&
+		port_conf->server_addr &&
+		strcmp(server_addr, port_conf->server_addr) == 0) {
+		if (resolve_common_server_port(port_conf) != 0) {
+			debug(LOG_ERR, "Failed to resolve server port for control connection");
+			return -1;
+		}
+		server_port = port_conf->server_port;
 	}
 
 	// Free existing connection if any
@@ -2360,12 +2386,15 @@ static void start_base_connect()
 		exit(1);
 	}
 
-	// Initialize server connection
-	if (init_server_connection(&main_ctl->connect_bev,
-							 main_ctl->connect_base,
-							 c_conf->server_addr,
-							 c_conf->server_port) != 0) {
-		exit(1);
+	/* Initialize server connection. A dynamic port source may be temporarily
+	 * unavailable, so keep retrying instead of exiting the client. */
+	while (init_server_connection(&main_ctl->connect_bev,
+								  main_ctl->connect_base,
+								  c_conf->server_addr,
+								  c_conf->server_port) != 0) {
+		sleep(RETRY_DELAY_SECONDS);
+		reset_session_id();
+		clear_main_control();
 	}
 
 	/* For QUIC transport, init_server_connection starts an async handshake.
@@ -2867,6 +2896,11 @@ static int init_frp_connection(struct bufferevent **bev_out, struct event_base *
 	struct common_conf *c_conf = get_common_config();
 	if (!c_conf) {
 		debug(LOG_ERR, "Failed to get common config");
+		return -1;
+	}
+
+	if (resolve_common_server_port(c_conf) != 0) {
+		debug(LOG_ERR, "Failed to resolve server port for login connection");
 		return -1;
 	}
 

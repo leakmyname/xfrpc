@@ -101,7 +101,8 @@ void ftp_proxy_c2s_cb(struct bufferevent *bev, void *ctx)
 		// Create and configure remote PASV response
 		struct ftp_pasv *r_fp = new_ftp_pasv();
 		r_fp->code = local_fp->code;
-		strncpy(r_fp->ftp_server_ip, c_conf->server_addr, IP_LEN);
+		strncpy(r_fp->ftp_server_ip, c_conf->server_addr, IP_LEN - 1);
+		r_fp->ftp_server_ip[IP_LEN - 1] = '\0';
 		r_fp->ftp_server_port = p->remote_data_port;
 
 		if (r_fp->ftp_server_port <= 0) {
